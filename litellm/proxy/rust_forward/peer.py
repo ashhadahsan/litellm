@@ -63,7 +63,7 @@ def wrap(app: "starlette.types.ASGIApp", mode: RustForwardMode) -> ASGIApp:
     match mode:
         case Supervised():
             return RustPeerMiddleware(converted, mode)
-        case Mode.DISABLED:
+        case Mode.DISABLED | Mode.SUPERVISOR:
             return converted
         case _:
             assert_never(mode)

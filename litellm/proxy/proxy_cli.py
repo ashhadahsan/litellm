@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
     from litellm.proxy.rust_forward.peer import ASGIApp
+    from litellm.proxy.rust_forward.server import PythonServer
 else:
     FastAPI = Any
 
@@ -840,6 +841,52 @@ class ProxyInitializationHelpers:
         return random.randint(1024, 49152) if port == 4000 and ProxyInitializationHelpers.is_port_in_use(port) else port
 
     @staticmethod
+    def python_server(
+        host: str,
+        port: int,
+        keepalive_timeout: int | None,
+        run_gunicorn: bool,
+        run_hypercorn: bool,
+        run_granian: bool,
+        tls: bool,
+    ) -> "PythonServer":
+        """``run_gunicorn_server`` never hands ``--keepalive_timeout`` or forwarded IPs to gunicorn, so its workers keep
+        gunicorn's keep-alive and gunicorn's trusted proxies, which include ``::1`` where uvicorn's do not."""
+        import uvicorn
+        from gunicorn.config import Config as GunicornConfig
+
+        from litellm.proxy.rust_forward.server import Listener, PythonServer, Server, uvicorn_trusted_proxies
+        from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
+
+        server: Final = (
+            Server.HYPERCORN
+            if run_hypercorn
+            else Server.GRANIAN
+            if run_granian
+            else Server.GUNICORN
+            if run_gunicorn
+            else Server.UVICORN
+        )
+        keepalive: Final = (
+            TypeAdapter(int).validate_python(GunicornConfig().keepalive)
+            if server is Server.GUNICORN
+            else uvicorn.Config(app="", log_config=None).timeout_keep_alive
+            if keepalive_timeout is None
+            else keepalive_timeout
+        )
+        return PythonServer(
+            server=server,
+            listener=Listener.TLS if tls else Listener.TCP,
+            host=host,
+            port=ProxyInitializationHelpers.serving_port(port),
+            keepalive_seconds=keepalive,
+            graceful_timeout_seconds=GracefulShutdownManager.get_timeout(),
+            trusted_proxies=",".join(TypeAdapter(list[str]).validate_python(GunicornConfig().forwarded_allow_ips))
+            if server is Server.GUNICORN
+            else uvicorn_trusted_proxies(None),
+        )
+
+    @staticmethod
     def get_loop_type():
         """Helper function to determine the event loop type based on platform"""
         if sys.platform in ("win32", "cygwin", "cli"):
@@ -1309,14 +1356,41 @@ def run_server(
         run_setup_wizard()
         return
 
+    from pydantic import ValidationError
+
     from litellm.proxy.rust_forward.mode import (
+        Mode,
+        environment_error,
         gunicorn_bind,
         rust_forward_mode,
         server_proxy_headers,
+        stop_with_supervisor,
         uvicorn_options,
     )
 
-    forward_mode: Final = rust_forward_mode(os.environ)
+    try:
+        forward_mode: Final = rust_forward_mode(os.environ)
+    except ValidationError as error:
+        raise click.ClickException(environment_error(error)) from None
+    stop_with_supervisor(forward_mode)
+    if forward_mode is Mode.SUPERVISOR and not any(
+        (version, validate_config, health, test, skip_server_startup, check_migrations_against_existing_data)
+    ):
+        from litellm.proxy.rust_forward.supervisor import supervise
+        from litellm.proxy.rust_forward.supervisor.preflight import StartupError
+
+        server: Final = ProxyInitializationHelpers.python_server(
+            host,
+            port,
+            keepalive_timeout,
+            run_gunicorn=run_gunicorn,
+            run_hypercorn=run_hypercorn,
+            run_granian=run_granian,
+            tls=None not in (ssl_keyfile_path, ssl_certfile_path),
+        )
+        supervised: Final = supervise(server, (sys.executable, "-m", "litellm.proxy.proxy_cli", *sys.argv[1:]))
+        if not isinstance(supervised, StartupError):
+            raise SystemExit(supervised)
 
     args: Final = locals()
     try:
