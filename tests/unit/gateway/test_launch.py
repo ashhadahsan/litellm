@@ -19,6 +19,14 @@ from gateway.launch import GATEWAY_APP, main, pool_database_url, uvicorn_argv
 from litellm.proxy.db.db_url_settings import DatabaseURLSettings
 from litellm.proxy.db.pgbouncer import PGBOUNCER_POOLED_ENV_VAR, PgBouncerError, PgBouncerSettings
 from litellm.proxy.proxy_server import app as proxy_app
+from litellm.proxy.rust_forward.mode import (
+    AssignedPort,
+    InheritedFd,
+    Mode,
+    RustForwardMode,
+    Supervised,
+    uvicorn_flags,
+)
 
 DB_ENV: Final = {
     "DATABASE_HOST": "db.internal",
@@ -114,6 +122,28 @@ def _uvicorn_params(argv: tuple[str, ...]) -> dict[str, object]:
 
 
 class TestUvicornArgv:
+    @pytest.mark.parametrize(
+        ("mode", "served"),
+        [
+            (Mode.DISABLED, {"host": "0.0.0.0", "port": 4000, "fd": None, "proxy_headers": True}),
+            (
+                Supervised(InheritedFd(17), "*"),
+                {"host": "0.0.0.0", "port": 4000, "fd": 17, "proxy_headers": False},
+            ),
+            (
+                Supervised(AssignedPort(45556), "*"),
+                {"host": "127.0.0.1", "port": 45556, "fd": None, "proxy_headers": False},
+            ),
+        ],
+    )
+    def test_supervised_uvicorn_serves_the_private_hop_and_never_trusts_it(
+        self, mode: RustForwardMode, served: dict[str, object]
+    ) -> None:
+        argv: Final = ("--host", "0.0.0.0", "--port", "4000", "--workers", "2", "--proxy-headers")
+        params: Final = _uvicorn_params((*uvicorn_argv((*argv, "--forwarded-allow-ips=*"), {}), *uvicorn_flags(mode)))
+        assert {name: params[name] for name in served} == served
+        assert (params["workers"], params["forwarded_allow_ips"]) == (2, "*")
+
     def test_keepalive_env_reaches_uvicorn(self):
         params: Final = _uvicorn_params(uvicorn_argv(("--workers", "4"), {"KEEPALIVE_TIMEOUT": "75"}))
         assert params["app"] == GATEWAY_APP
